@@ -52,7 +52,7 @@ fn main() -> Result<()> {
     let ccbin_env = std::env::var("CANDLE_NVCC_CCBIN");
     println!("cargo:rerun-if-env-changed=CANDLE_NVCC_CCBIN");
 
-    let compute_cap = compute_cap()?;
+    let compute_caps = compute_caps()?;
 
     let out_file = build_dir.join("libflashattentionv1.a");
 
@@ -70,7 +70,6 @@ fn main() -> Result<()> {
         kernel_dir
             .read_dir()
             .expect("kernels folder should exist")
-            .into_iter()
             .any(|entry| {
                 if let (Ok(entry), Ok(out_modified)) = (entry, &out_modified) {
                     let in_modified = entry.metadata().unwrap().modified().unwrap();
@@ -86,41 +85,46 @@ fn main() -> Result<()> {
         cu_files
             .par_iter()
             .map(|(cu_file, obj_file)| {
-                let mut command = std::process::Command::new("nvcc");
-                command
-                    .arg("-std=c++17")
-                    .arg(format!("--gpu-architecture=sm_{compute_cap}"))
-                    .arg("-c")
-                    .args(["-o", obj_file.to_str().unwrap()])
-                    .args(["--default-stream", "per-thread"])
-                    .arg("-Icutlass/include")
-                    .arg("-U__CUDA_NO_HALF_OPERATORS__")
-                    .arg("-U__CUDA_NO_HALF_CONVERSIONS__")
-                    .arg("-U__CUDA_NO_HALF2_OPERATORS__")
-                    .arg("-U__CUDA_NO_BFLOAT16_CONVERSIONS__")
-                    .arg("--expt-relaxed-constexpr")
-                    .arg("--expt-extended-lambda")
-                    .arg("--use_fast_math")
-                    .arg("--ptxas-options=-v")
-                    .arg("--verbose");
-                if let Ok(ccbin_path) = &ccbin_env {
-                    command
-                        .arg("-allow-unsupported-compiler")
-                        .args(["-ccbin", ccbin_path]);
-                }
-                command.arg(cu_file);
-                let output = command
-                    .spawn()
-                    .context("failed spawning nvcc")?
-                    .wait_with_output()?;
-                if !output.status.success() {
-                    anyhow::bail!(
+                compute_caps.par_iter().map(
+                    |compute_cap| {
+                        let mut command = std::process::Command::new("nvcc");
+                        command
+                            .arg("-std=c++17")
+                            .arg(format!("--gpu-architecture=sm_{compute_cap}"))
+                            .arg("-c")
+                            .args(["-o", obj_file.to_str().unwrap()])
+                            .args(["--default-stream", "per-thread"])
+                            .arg("-Icutlass/include")
+                            .arg("-U__CUDA_NO_HALF_OPERATORS__")
+                            .arg("-U__CUDA_NO_HALF_CONVERSIONS__")
+                            .arg("-U__CUDA_NO_HALF2_OPERATORS__")
+                            .arg("-U__CUDA_NO_BFLOAT16_CONVERSIONS__")
+                            .arg("--expt-relaxed-constexpr")
+                            .arg("--expt-extended-lambda")
+                            .arg("--use_fast_math")
+                            .arg("--ptxas-options=-v")
+                            .arg("--verbose");
+                        if let Ok(ccbin_path) = &ccbin_env {
+                            command
+                                .arg("-allow-unsupported-compiler")
+                                .args(["-ccbin", ccbin_path]);
+                        }
+                        command.arg(cu_file);
+                        let output = command
+                            .spawn()
+                            .context("failed spawning nvcc")?
+                            .wait_with_output()?;
+                        if !output.status.success() {
+                            anyhow::bail!(
                         "nvcc error while executing compiling: {:?}\n\n# stdout\n{:#}\n\n# stderr\n{:#}",
                         &command,
                         String::from_utf8_lossy(&output.stdout),
                         String::from_utf8_lossy(&output.stderr)
                     )
-                }
+                        }
+                        Ok(())
+                    }
+                ).collect::<Result<()>>()?;
                 Ok(())
             })
             .collect::<Result<()>>()?;
@@ -186,14 +190,23 @@ fn set_cuda_include_dir() -> Result<()> {
 }
 
 #[allow(unused)]
-fn compute_cap() -> Result<usize> {
-    // Grab compute code from nvidia-smi
-    let mut compute_cap = {
+fn compute_caps() -> Result<Vec<usize>> {
+    println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAPS");
+
+    // Try to parse compute caps from env
+    let mut compute_caps = if let Ok(compute_cap_str) = std::env::var("CUDA_COMPUTE_CAPS") {
+        println!("cargo:rustc-env=CUDA_COMPUTE_CAPS={compute_cap_str}");
+        compute_cap_str
+            .split(',')
+            .map(|code_str| code_str.parse::<usize>().context("Could not parse code"))
+            .collect::<Result<Vec<usize>>>()?
+    } else {
+        // Use nvidia-smi to get the current compute cap
         let out = std::process::Command::new("nvidia-smi")
-                    .arg("--query-gpu=compute_cap")
-                    .arg("--format=csv")
-                    .output()
-                    .context("`nvidia-smi` failed. Ensure that you have CUDA installed and that `nvidia-smi` is in your PATH.")?;
+            .arg("--query-gpu=compute_cap")
+            .arg("--format=csv")
+            .output()
+            .context("`nvidia-smi` failed. Ensure that you have CUDA installed and that `nvidia-smi` is in your PATH.")?;
         let out = std::str::from_utf8(&out.stdout).context("stdout is not a utf8 string")?;
         let mut lines = out.lines();
         assert_eq!(
@@ -204,16 +217,19 @@ fn compute_cap() -> Result<usize> {
             .next()
             .context("missing line in stdout")?
             .replace('.', "");
-        cap.parse::<usize>()
-            .with_context(|| format!("cannot parse as int {cap}"))?
+        let cap = cap
+            .parse::<usize>()
+            .with_context(|| format!("cannot parse as int {cap}"))?;
+        println!("cargo:rustc-env=CUDA_COMPUTE_CAPS={cap}");
+        vec![cap]
     };
 
     // Grab available GPU codes from nvcc and select the highest one
-    let max_nvcc_code = {
+    let (supported_nvcc_codes, max_nvcc_code) = {
         let out = std::process::Command::new("nvcc")
-                    .arg("--list-gpu-code")
-                    .output()
-                    .expect("`nvcc` failed. Ensure that you have CUDA installed and that `nvcc` is in your PATH.");
+            .arg("--list-gpu-code")
+            .output()
+            .expect("`nvcc` failed. Ensure that you have CUDA installed and that `nvcc` is in your PATH.");
         let out = std::str::from_utf8(&out.stdout).unwrap();
 
         let out = out.lines().collect::<Vec<&str>>();
@@ -227,30 +243,25 @@ fn compute_cap() -> Result<usize> {
             }
         }
         codes.sort();
-        if !codes.contains(&compute_cap) {
-            anyhow::bail!(
-                "nvcc cannot target gpu arch {compute_cap}. Available nvcc targets are {codes:?}."
-            );
-        }
-        *codes.last().unwrap()
+        let max_nvcc_code = *codes.last().unwrap();
+        (codes, max_nvcc_code)
     };
 
-    // If nvidia-smi compute_cap is higher than the highest gpu code from nvcc,
-    // then choose the highest gpu code in nvcc
-    if compute_cap > max_nvcc_code {
-        println!(
-            "cargo:warning=Lowering gpu arch {compute_cap} to max nvcc target {max_nvcc_code}."
-        );
-        compute_cap = max_nvcc_code;
+    println!("cargo:warning={compute_caps:?}");
+
+    // Check that nvcc supports the asked compute caps
+    for cap in compute_caps.iter() {
+        if !supported_nvcc_codes.contains(cap) {
+            anyhow::bail!(
+                "nvcc cannot target gpu arch {cap}. Available nvcc targets are {supported_nvcc_codes:?}."
+            );
+        }
+        if cap > &max_nvcc_code {
+            anyhow::bail!(
+                "CUDA compute cap {cap} is higher than the highest gpu code from nvcc {max_nvcc_code}"
+            );
+        }
     }
 
-    println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
-    if let Ok(compute_cap_str) = std::env::var("CUDA_COMPUTE_CAP") {
-        compute_cap = compute_cap_str
-            .parse::<usize>()
-            .with_context(|| format!("cannot parse as usize '{compute_cap_str}'"))?;
-        println!("cargo:warning=Using gpu arch {compute_cap} from $CUDA_COMPUTE_CAP");
-    }
-    println!("cargo:rustc-env=CUDA_COMPUTE_CAP=sm_{compute_cap}");
-    Ok(compute_cap)
+    Ok(compute_caps)
 }
