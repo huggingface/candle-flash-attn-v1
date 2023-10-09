@@ -247,8 +247,6 @@ fn compute_caps() -> Result<Vec<usize>> {
         (codes, max_nvcc_code)
     };
 
-    println!("cargo:warning={compute_caps:?}");
-
     // Check that nvcc supports the asked compute caps
     for cap in compute_caps.iter() {
         if !supported_nvcc_codes.contains(cap) {
