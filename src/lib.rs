@@ -41,8 +41,8 @@ impl FlashAttnVarLen {
 
         let (seqlens_q, seqlens_q_layout) = self.seqlens_q.storage_and_layout();
         let seqlens_q = match &*seqlens_q {
-            candle::Storage::Cpu(_) => candle::bail!("seqlens_q must be a cuda tensor"),
             candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?, // Should be i32!
+            _ => candle::bail!("seqlens_q must be a cuda tensor"),
         };
         let seqlens_q = match seqlens_q_layout.contiguous_offsets() {
             Some((o1, o2)) => seqlens_q.slice(o1..o2),
@@ -51,17 +51,17 @@ impl FlashAttnVarLen {
 
         let (seqlens_k, seqlens_k_layout) = self.seqlens_k.storage_and_layout();
         let seqlens_k = match &*seqlens_k {
-            candle::Storage::Cpu(_) => candle::bail!("seqlens_k must be a cuda tensor"),
             candle::Storage::Cuda(c) => c.as_cuda_slice::<u32>()?, // Should be i32!
+            _ => candle::bail!("seqlens_k must be a cuda tensor"),
         };
         let seqlens_k = match seqlens_k_layout.contiguous_offsets() {
             Some((o1, o2)) => seqlens_k.slice(o1..o2),
             None => candle::bail!("seqlens_k has to be contiguous"),
         };
 
-        let q = q.as_cuda_slice::<f16>()?;
-        let k = k.as_cuda_slice::<f16>()?;
-        let v = v.as_cuda_slice::<f16>()?;
+        let q = q.as_cuda_slice::<T>()?;
+        let k = k.as_cuda_slice::<T>()?;
+        let v = v.as_cuda_slice::<T>()?;
         let q = q.slice(q_l.start_offset()..);
         let k = k.slice(k_l.start_offset()..);
         let v = v.slice(v_l.start_offset()..);
@@ -122,7 +122,7 @@ impl FlashAttnVarLen {
         let batch_size = nseqlens_q - 1;
 
         let elem_count = out_shape.elem_count();
-        let dst = unsafe { dev.alloc::<f16>(elem_count) }.w()?;
+        let dst = unsafe { dev.alloc::<T>(elem_count) }.w()?;
         let softmax_lse = dev
             .alloc_zeros::<f32>(batch_size * num_heads * self.max_seqlen_q)
             .w()?;
